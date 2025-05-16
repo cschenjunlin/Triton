@@ -13,11 +13,7 @@ In doing so, you will learn about:
 * The best practices for validating and benchmarking your custom ops against native reference implementations.
 
 """
-
-# %%
-# Compute Kernel
-# --------------
-
+import numpy as np
 import torch
 
 import triton
@@ -26,6 +22,11 @@ import triton.language as tl
 # DEVICE = triton.runtime.driver.active.get_active_torch_device()
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
+
+
+# %%
+# Compute Kernel
+# --------------
 
 @triton.jit
 def add_kernel(x_ptr,  # *Pointer* to first input vector.
@@ -44,6 +45,10 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
     tl.store(output_ptr + offsets, output, mask=mask)
 
 
+# %%
+# Let's also declare a helper function to (1) allocate the `z` tensor
+# and (2) enqueue the above kernel with appropriate grid/block sizes:
+
 def add(x: torch.Tensor, y: torch.Tensor):
     output = torch.empty_like(x)
     assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
@@ -53,17 +58,31 @@ def add(x: torch.Tensor, y: torch.Tensor):
     return output
 
 
+# %%
+# Unit Test
+# ---------
+
 torch.manual_seed(0)
 size = 10086
 x = torch.rand(size, device=DEVICE)
 y = torch.rand(size, device=DEVICE)
+
+output_numpy = x.cpu().numpy() + y.cpu().numpy()
 output_torch = x + y
 output_triton = add(x, y)
+
+print(output_numpy)
 print(output_torch)
 print(output_triton)
+print(f'The maximum difference between numpy and triton is '
+      f'{np.max(np.abs(output_numpy - output_triton.cpu().numpy()))}')
 print(f'The maximum difference between torch and triton is '
       f'{torch.max(torch.abs(output_torch - output_triton))}')
 
+
+# %%
+# Benchmark
+# ---------
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -91,4 +110,3 @@ def benchmark(size, provider):
 
 
 benchmark.run(print_data=True, show_plots=True)
-
