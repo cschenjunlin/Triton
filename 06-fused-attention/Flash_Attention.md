@@ -1,13 +1,63 @@
+<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
 # Flash Attention
 
-The main idea is that we split the inputs Q, K, V into blocks, load them from slow HBM to fast SRAM, then compute the attention output with respect to those blocks. By scaling the output of each block by the right normalization factor before adding them up, we get the correct result at the end.
+## Background
+
+GPU 存储包括芯片内 Shared Memory (SRAM) 和芯片外全局显存 (HBM)。SRAM访问速度快，但容量小；HBM 容量大，但访问速度慢。
+
+Softmax 计算需要一整行数据，HBM 中需要存储完整的 QK^T 矩阵，占用 O(n^2)。
+
+传统 Attention 实现过程：
+
+- 从 HBM 加载 Q, K 到 SRAM，访存次数：O(Nd).
+- 计算 S = QK^T，计算次数：O(N^2d).
+- 从 SRAM 将 S 写回到 HBM，访存次数：O(N^2).
+- 从 HBM 加载 S 到 SRAM，访存次数：O(N^2).
+- 计算 P = softmax(S)，计算次数：O(N^2).
+- 从 SRAM 将 P 写回到 HBM，访存次数：O(N^2).
+- 从 HBM 加载 P, V 到 SRAM，访存次数：O(N^2+Nd).
+- 计算 O = PV，O(N^2d).
+- 从 SRAM 将 O 写回到 HBM，访存次数：O(Nd).
+
+总计算次数：O(N^2d).
+总访存次数：O(N^2+Nd).
 
 ## Tiling
 
-![Tiling](Tiling.png)
+通过中间量 m, f, l 实现 softmax 的分块计算：
+
+- m(x): 当前块 x 的最大值，在计算 softmax 时将指数减去最大值，以保证数值稳定 (safe softmax).
+- f(x): 当前块 x 计算 softmax 时的分子部分.
+- l(x): 当前块 x 计算 softmax 时的分母部分，即当前 f(x) 的累加和.
 
 ![Formula](Formula.png)
 
+## Recomputation
+
+在反向传播中：
+
+- 不存储 O(N^2) 中间量 S, P.
+- 存储 O(Nd) 输出矩阵 O, O(N) 中间量 m, l.
+- 从 SRAM 中的 Q, K, V 重新计算 S, P.
+
 ## Algorithm
 
+Flash Attention 实现过程：
+
+- 在 HBM 中初始化 O, l, m，将 Q, K, V, O分块.
+- 外层循环：从 HBM 加载 K，V 的第 j 块到 SRAM，总访存次数：O(Nd).
+- 内层循环：从 HBM 加载 Q, O, l, m 的第 i 块到 SRAM，总访存次数：O(Nd+N).
+- 计算 S_ij = Q_i·K^T_j，总计算次数：O(N^2d).
+- 计算局部 m_ij, P_ij, l_ij，计算次数：O(N^2+N).
+- 计算全局 m_i, l_i，计算次数：O(C).
+- 计算 O_i，计算次数：O(N^2d).
+- 从 SRAM 将 O_i 写回到 HBM，总访存次数：O(Nd).
+- 从 SRAM 将 l_i, m_i 写回到 HBM，总访存次数：O(N).
+
+总计算次数：O(N^2d+N).
+总访存次数：O(Nd+N).
+
 ![Algorithm](Algorithm.png)
+
