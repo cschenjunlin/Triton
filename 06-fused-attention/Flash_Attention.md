@@ -72,15 +72,17 @@ flattened_Q/K/V.shape = [y_dim, HEAD_DIM]
 ```
 
 ```
-[Z, H, N_CTX, HEAD_DIM, BLOCK_M] = [2, 3, 4, 8, 2]
-assert BLOCK_M <= N_CTX and BLOCK_N == HEAD_DIM
+[Z, H, N_CTX, HEAD_DIM] = [2, 3, 4, 8]
 
 Q/K/V:
+
+    head_0       head_1       head_2
+      ^            ^            ^
 ┌────────────┬────────────┬────────────┐
-│ (z=0,h=0)  │ (z=0,h=1)  │ (z=0,h=2)  │  => batch 0
+│ (z=0,h=0)  │ (z=0,h=1)  │ (z=0,h=2)  │  => batch_0
 │ [4 x 8]    │ [4 x 8]    │ [4 x 8]    │
 ├────────────┼────────────┼────────────┤
-│ (z=1,h=0)  │ (z=1,h=1)  │ (z=1,h=2)  │  => batch 1
+│ (z=1,h=0)  │ (z=1,h=1)  │ (z=1,h=2)  │  => batch_1
 │ [4 x 8]    │ [4 x 8]    │ [4 x 8]    │
 └────────────┴────────────┴────────────┘
 
@@ -92,6 +94,10 @@ flattened_Q/K/V:
 ```
 
 ### Grid scheduling structure
+```
+[BLOCK_M, BLOCK_N] = [2, HEAD_DIM]
+assert N_CTX % BLOCK_M == 0 and HEAD_DIM == BLOCK_N
+```
 
 ```
 grid.shape = [N_CTX // BLOCK_M, Z * H]
