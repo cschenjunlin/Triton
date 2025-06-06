@@ -154,12 +154,12 @@ def _attn_fwd(sm_scale, M,  #
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    start_m = tl.program_id(0)      # 当前 Block 在 Grid 中的行索引
+    off_hz = tl.program_id(1)       # 当前 Block 在 Grid 中的列索引
+    off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
+    off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
 
-    y_dim = Z * H * N_CTX
+    y_dim = Z * H * N_CTX       # 整个 Q/K/V/O 张量的 flattened row 维度大小
     desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
@@ -169,8 +169,8 @@ def _attn_fwd(sm_scale, M,  #
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
+    qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
