@@ -61,3 +61,76 @@ Flash Attention 实现过程：
 
 ![Algorithm](Algorithm.png)
 
+## Storage Structure (v2)
+
+### Flattened Q/K/V
+
+```
+Q/K/V.shape = [Z, H, N_CTX, HEAD_DIM]
+y_dim = Z * H * N_CTX
+flattened_Q/K/V.shape = [y_dim, HEAD_DIM]
+```
+
+```
+[Z, H, N_CTX, HEAD_DIM, BLOCK_M] = [2, 3, 4, 8, 2]
+assert BLOCK_M <= N_CTX and BLOCK_N == HEAD_DIM
+
+Q/K/V:
+┌────────────┬────────────┬────────────┐
+│ (z=0,h=0)  │ (z=0,h=1)  │ (z=0,h=2)  │  => batch 0
+│ [4 x 8]    │ [4 x 8]    │ [4 x 8]    │
+├────────────┼────────────┼────────────┤
+│ (z=1,h=0)  │ (z=1,h=1)  │ (z=1,h=2)  │  => batch 1
+│ [4 x 8]    │ [4 x 8]    │ [4 x 8]    │
+└────────────┴────────────┴────────────┘
+
+flattened_Q/K/V:
+┌────────────────────────────────────────────────────────────┐
+│ head_00   head_01   head_02   head_10   head_11   head_12  │
+│ [4 x 8]   [4 x 8]   [4 x 8]   [4 x 8]   [4 x 8]   [4 x 8]  │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Grid scheduling structure
+
+```
+grid.shape = [N_CTX // BLOCK_M, Z * H]
+
+logical structure:
+<------------------------tl.program_id(1)------------------------->
+┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐       ^
+│ head_000 | head_010 | head_020 | head_100 | head_110 | head_120 │       |
+│ [2 x 8]  | [2 x 8]  | [2 x 8]  |  [2 x 8] |  [2 x 8] |  [2 x 8] │       |
+│----------|----------|----------|----------|----------|----------│ tl.program_id(0)
+│ head_001 | head_011 | head_021 | head_101 | head_111 | head_121 │       |
+│ [2 x 8]  | [2 x 8]  | [2 x 8]  | [2 x 8]  | [2 x 8]  | [2 x 8]  │       |
+└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘       v
+
+physical structure: (actual loading method)
+┌──────────┐
+│ head_000 │
+│ [2 x 8]  │
+│----------│
+│ head_001 │
+│ [2 x 8]  │
+│----------│
+│   ...    │
+│----------│
+│ head_120 │
+│ [2 x 8]  │
+│----------│
+│ head_121 │
+│ [2 x 8]  │
+└──────────┘
+```
+
+### Triton code
+
+```
+start_m = tl.program_id(0)      # 当前 Block 在 Grid 中的行索引
+off_hz = tl.program_id(1)       # 当前 Block 在 Grid 中的列索引
+off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
+off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
+offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
+qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
+```
