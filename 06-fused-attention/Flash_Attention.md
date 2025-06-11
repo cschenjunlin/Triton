@@ -24,6 +24,14 @@ Softmax 计算需要一整行数据，HBM 中需要存储完整的 QK^T 矩阵�
 总计算次数：O(N^2d).
 总访存次数：O(N^2+Nd).
 
+## Kernel Fusion (算子融合)
+
+算子是 GPU 的基本计算单元，通常对应一段独立的 CUDA 内核代码或库调用。
+
+算子融合通过将多个逻辑上连续的算子合并为一个整体的算子，可以共享中间结果、减少显存访问、内核启动开销。
+
+Flash Attention 将 Attention 计算中的矩阵乘法、softmax 等独立的基本算子融合为一个可以直接调用的算子。
+
 ## Tiling
 
 通过中间量 m, f, l 实现 softmax 的分块计算：
@@ -95,12 +103,21 @@ flattened_Q/K/V:
 
 ### Grid scheduling structure
 ```
+grid.shape = [N_CTX // BLOCK_M, Z * H, 1]
+```
+
+```
 [BLOCK_M, BLOCK_N] = [2, HEAD_DIM]
 assert N_CTX % BLOCK_M == 0 and HEAD_DIM == BLOCK_N
 ```
 
 ```
-grid.shape = [N_CTX // BLOCK_M, Z * H]
+start_m = tl.program_id(0)      # 当前 Block 在 Grid 中的行索引
+off_hz = tl.program_id(1)       # 当前 Block 在 Grid 中的列索引
+off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
+off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
+offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
+qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
 
 logical structure:
 <------------------------tl.program_id(1)------------------------->
@@ -130,13 +147,9 @@ physical structure: (actual loading method)
 └──────────┘
 ```
 
-### Triton code
+## LogSumExp
 
-```
-start_m = tl.program_id(0)      # 当前 Block 在 Grid 中的行索引
-off_hz = tl.program_id(1)       # 当前 Block 在 Grid 中的列索引
-off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
-off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
-offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
-qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
-```
+## Forward
+
+## Backward
+

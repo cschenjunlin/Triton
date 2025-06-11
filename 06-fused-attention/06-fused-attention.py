@@ -44,8 +44,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr, warp_specialize: tl.constexpr):
     # range of values handled by this stage
+    # stage 1: off-band
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
+    # stage 2: on-band
     elif STAGE == 2:
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
@@ -140,6 +142,8 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
+# configs: 定义具体的内核执行参数组合，必须为 tl.constexpr（编译时常量）
+# key: 定义哪些参数变化需要触发重新调优，不一定为 tl.constexpr，但必须为内核调用时传递的变量
 @triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
@@ -186,6 +190,7 @@ def _attn_fwd(sm_scale, M,  #
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+    # & : bitwise AND
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
@@ -204,7 +209,7 @@ def _attn_fwd(sm_scale, M,  #
                                         2, offs_m, offs_n, N_CTX,  #
                                         warp_specialize)
     # epilogue
-    m_i += tl.math.log2(l_i)
+    m_i += tl.math.log2(l_i)    # LogSumExp
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
@@ -499,7 +504,7 @@ class _attention(torch.autograd.Function):
         triton.set_allocator(alloc_fn)
 
         def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)   # (N_CTX // BLOCK_M, Z * H, 1)
 
         ctx.grid = grid
         _attn_fwd[grid](
