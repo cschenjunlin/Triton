@@ -116,8 +116,9 @@ start_m = tl.program_id(0)      # 当前 Block 在 Grid 中的行索引
 off_hz = tl.program_id(1)       # 当前 Block 在 Grid 中的列索引
 off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
 off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
-offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
-qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
+# 每个 head 具有独立的一组 Q/K/V，一组 Q/K/V 具有相同的 head 索引
+offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 head 在整个 flattened Q/K/V 张量中的起始行索引
+qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Q 子块 在 flatten Q 中起始行索引
 
 logical structure:
 <------------------------tl.program_id(1)------------------------->
@@ -150,6 +151,29 @@ physical structure: (actual loading method)
 ## LogSumExp
 
 ## Forward
+
+### Stage 1: Off-band，累计之前位置的注意力贡献
+
+- 处理当前 q 所在 block 之前位置的所有 k/v
+
+```
+low, high = 0, start_m * BLOCK_M
+```
+
+### Stage 2: On-band，当前位置的注意力计算
+
+- 处理当前 q 所在 block 位置的 k/v 的相同位置部分
+
+```
+lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+```
+
+- 最后一个 k/v block 中可能包含未来 token（k/v 在 q 的右边），在 causal 模式下需要加掩码：
+
+```
+mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+```
 
 ## Backward
 

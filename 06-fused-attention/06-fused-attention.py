@@ -57,10 +57,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     offsetkv_y = offset_y + lo
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # assert start_n % BLOCK_N == 0
+        start_n = tl.multiple_of(start_n, BLOCK_N)  # Triton compiler optimization hint
         # -- compute qk ----
         k = desc_k.load([offsetkv_y, 0]).T
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k)   # shape = [BLOCK_M, BLOCK_N]
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -163,7 +164,7 @@ def _attn_fwd(sm_scale, M,  #
     off_z = off_hz // H             # 当前 Block 对应的 batch 维度索引
     off_h = off_hz % H              # 当前 Block 对应的 attention head 索引
 
-    y_dim = Z * H * N_CTX       # 整个 Q/K/V/O 张量的 flattened row 维度大小
+    y_dim = Z * H * N_CTX           # 整个 Q/K/V/O 张量的 flattened row 维度大小
     desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
