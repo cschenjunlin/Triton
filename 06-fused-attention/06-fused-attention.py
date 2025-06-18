@@ -36,6 +36,8 @@ def supports_host_descriptor():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 
+# 前向传播核心计算函数
+# 负责具体的矩阵乘法、掩码应用、累加器更新等操作
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
@@ -62,6 +64,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # -- compute qk ----
         k = desc_k.load([offsetkv_y, 0]).T
         qk = tl.dot(q, k)   # shape = [BLOCK_M, BLOCK_N]
+        # m_i: past max
+        # tl.max(qk, 1): current block max in dim_1
+        # m_ij: new max
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -70,9 +75,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
+        p = tl.math.exp2(qk)        # p.shape = [BLOCK_M, BLOCK_N]
         # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
+        alpha = tl.math.exp2(m_i - m_ij)    # alpha.shape = [BLOCK_M]
         l_ij = tl.sum(p, 1)
         # -- update output accumulator --
         acc = acc * alpha[:, None]
@@ -147,6 +152,8 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
 # key: 定义哪些参数变化需要触发重新调优，不一定为 tl.constexpr，但必须为内核调用时传递的变量
 @triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
+# 前向传播辅助函数
+# 负责初始化各种参数、加载数据、调度不同的计算阶段，并最终将结果存储回内存
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -184,6 +191,7 @@ def _attn_fwd(sm_scale, M,  #
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
+    # exp(qk * qk_scale) = exp2(qk * qk_scale * log2(e)), exp2 是硬件原生指令，执行速度更快
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
