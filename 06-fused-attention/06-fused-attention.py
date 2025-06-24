@@ -181,7 +181,7 @@ def _attn_fwd(sm_scale, M,  #
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 Head 在整个 flattened Q/K/V 张量中的起始行索引
+    offset_y = off_z * (N_CTX * H) + off_h * N_CTX      # 当前 (batch, head) 在整个 flattened Q/K/V 张量中的起始行索引
     qo_offset_y = offset_y + start_m * BLOCK_M          # 当前 Block 要读取的 Query 子块 起始行索引
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -226,8 +226,8 @@ def _attn_fwd(sm_scale, M,  #
 
 
 @triton.jit
-def _attn_bwd_preprocess(O, DO,  #
-                         Delta,  #
+def _attn_bwd_preprocess(O, DO,  # shape = [BLOCK_M, HEAD_DIM]
+                         Delta,  # shape = [BLOCK_M]
                          Z, H, N_CTX,  #
                          BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
                          ):
@@ -245,7 +245,7 @@ def _attn_bwd_preprocess(O, DO,  #
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
 def _attn_bwd_dkdv(dk, dv,  #
-                   Q, k, v, sm_scale,  #
+                   Q, k, v, sm_scale,  # k/v.shape = [BLOCK_N1, HEAD_DIM]
                    DO,  #
                    M, D,  #
                    # shared by Q/K/V/DO.
@@ -259,30 +259,30 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
+    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d     # 转置访问
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
+        qT = tl.load(qT_ptrs)       # qT.shape = [HEAD_DIM, BLOCK_M1]
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
+        m = tl.load(M + offs_m)     # m.shape = [BLOCK_M1]
         qkT = tl.dot(k, qT)
-        pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.math.exp2(qkT - m[None, :])     # pT.shape = [BLOCK_N1, BLOCK_M1]
         # Autoregressive masking.
         if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
-            pT = tl.where(mask, pT, 0.0)
-        do = tl.load(do_ptrs)
+            mask = (offs_m[None, :] >= offs_n[:, None])     # j >= i
+            pT = tl.where(mask, pT, 0.0)        # j >= i in pT == i >= j in p
+        do = tl.load(do_ptrs)       # do.shape = [BLOCK_M1, HEAD_DIM]
         # Compute dV.
         ppT = pT
         ppT = ppT.to(tl.float16)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
+        Di = tl.load(D + offs_m)    # Di.shape = [BLOCK_M1]
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
@@ -295,7 +295,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     return dk, dv
 
 
-# the main inner-loop logic for computing dQ
+# The main inner-loop logic for computing dQ.
 @triton.jit
 def _attn_bwd_dq(dq, q, K, V,  #
                  do, m, D,
@@ -327,7 +327,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
+            mask = (offs_m[:, None] >= offs_n[None, :])     # i >= j
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
@@ -343,6 +343,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
     return dq
 
 
+# 反向传播辅助函数
+# 负责初始化参数、计算偏移、加载数据、调度不同的计算阶段，并最终将结果存储回内存
 @triton.jit
 def _attn_bwd(Q, K, V, sm_scale,  #
               DO,  #
@@ -351,6 +353,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               # shared by Q/K/V/DO.
               stride_z, stride_h, stride_tok, stride_d,  #
               H, N_CTX,  #
+              # different BLOCK_SIZE to optimize the two stages respectively
               BLOCK_M1: tl.constexpr,  #
               BLOCK_N1: tl.constexpr,  #
               BLOCK_M2: tl.constexpr,  #
@@ -359,9 +362,9 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               HEAD_DIM: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
-    bhid = tl.program_id(2)
-    off_chz = (bhid * N_CTX).to(tl.int64)
-    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
+    bhid = tl.program_id(2)     # batch 和 head 的联合 index
+    off_chz = (bhid * N_CTX).to(tl.int64)       # 当前 (batch, head) 的起始行索引 (token-level index)
+    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)     # 当前 (batch, head) 的起始内存地址
     pid = tl.program_id(0)
 
     # offset pointers for batch/head
@@ -379,6 +382,9 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     offs_k = tl.arange(0, HEAD_DIM)
 
     start_n = pid * BLOCK_N1
+
+# compute dk, dv
+    # stage1: masked blocks (diagonal blocks)
     start_m = start_n
 
     MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
@@ -391,8 +397,10 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
     v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
 
+    # tl.static_assert(BLOCK_N1 % MASK_BLOCK_M1 == 0)
     num_steps = BLOCK_N1 // MASK_BLOCK_M1
 
+    # Compute dK and dV for masked blocks.
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
                             Q, k, v, sm_scale,  #
                             DO,  #
@@ -404,6 +412,10 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                             MASK=True  #
                             )
 
+    # stage 2: non-masked blocks (below-diagonal blocks)
+    # As BLOCK_N1 % MASK_BLOCK_M1 == 0,
+    # actually num_steps * MASK_BLOCK_M1 == BLOCK_N1,
+    # and start_m % BLOCK_N1 == 0
     start_m += num_steps * MASK_BLOCK_M1
     num_steps = (N_CTX - start_m) // BLOCK_M1
 
@@ -420,6 +432,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         MASK=False  #
     )
 
+    # Write back dV.
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv)
 
@@ -428,7 +441,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dk_ptrs, dk)
 
-    # THIS BLOCK DOES DQ:
+# compute dq
+    # stage 1
     start_m = pid * BLOCK_M2
     end_n = start_m + BLOCK_M2
 
@@ -457,6 +471,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                       MASK=True  #
                       )
     end_n -= num_steps * MASK_BLOCK_N2
+
     # stage 2
     num_steps = end_n // BLOCK_N2
     dq = _attn_bwd_dq(dq, q, K, V,  #
