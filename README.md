@@ -1,12 +1,36 @@
-# Triton Learning
-
-## Introduction
+# Triton 
 
 `Triton`是一种用于编写高效自定义深度学习原语的语言和编译器。它的目标是提供一个开源环境，让用户能够以比使用 CUDA 更高的生产效率编写快速代码，同时还能比其他现有的领域特定语言（DSL）更具灵活性。
 
-## Triton Installation 
+# Grid
 
-### from source
+在 `Triton` 中，`grid` 用于定义 GPU 内核的​​执行网格​​，即决定内核在 GPU 上如何并行执行。
+
+构建 `grid` 的方式：
+
+- 固定 `grid`（直接赋值为元组）
+
+```
+grid = (16, 16)  # 2D grid，16x16 blocks
+kernel[grid](...)
+```
+
+- 动态 `grid` （lambda 函数）​
+
+```
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
+kernel[grid](...)
+```
+
+- 更复杂的动态 `grid`（自定义函数）​
+
+```
+def grid(META):
+    return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+kernel[grid](...)
+```
+
+# Installation from source
 
 ```
 git clone https://github.com/triton-lang/triton.git
@@ -25,36 +49,36 @@ pip install -e .
 
 最终产物为一个共享库`python/triton/_C/libtriton.so`
 
-## Triton Kernel Compilation (Lowering)
+# Triton Kernel Compilation (Lowering)
 
 `libtriton.so`是`Triton`的 C++ 编译器核心，其通过`Pybind11`暴露为 Python 可调用模块`triton._C.libtriton`。它通常不会由用户手动调用，而是由`Triton`的 Python 包的内部模块自动使用。
 
-### Python Triton kernel -> Triton IR (TTIR)
+## Python Triton kernel -> Triton IR (TTIR)
 
 - 在 Python 中完成，不直接调用`libtriton.so`
 
-### Triton IR -> LLVM IR (LLIR)
+## Triton IR -> LLVM IR (LLIR)
 
 ```
 # python/triton/compiler.py
 libtriton.compile_ttir_to_llir(...)
 ```
 
-### LLVM IR -> PTX
+## LLVM IR -> PTX
 
 ```
 # python/triton/compiler.py
 libtriton.compile_llir_to_ptx(...)
 ```
 
-### PTX -> CUBIN
+## PTX -> CUBIN
 
 ```
 # python/triton/compiler.py
 libtriton.link_ptx(...)
 ```
 
-### Kernel Launch
+## Kernel Launch
 
 ```
 # python/triton/runtime/launcher.py
@@ -62,6 +86,6 @@ libtriton.get_function(...)
 libtriton.launch(...)
 ```
 
-### 流程图：
+## 流程图：
 
 ![Schematic](Triton_lowering.png)
